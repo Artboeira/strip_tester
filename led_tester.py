@@ -323,9 +323,7 @@ sm       = StripManager()
 engine   = AnimationEngine(sm)
 ws_peers: set = set()
 
-FONTS_DIR: str = os.path.expanduser(
-    '~/Downloads/Estúdio AB Design System/fonts'
-)
+FONTS_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -542,8 +540,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14
 
 /* ── Header ── */
 .hdr{
-  display:flex;align-items:center;gap:14px;
-  padding:0 22px;height:54px;
+  display:flex;align-items:center;gap:16px;
+  padding:0 26px;height:66px;
   background:var(--surf);border-bottom:1px solid var(--border);
   flex-shrink:0;position:relative;
 }
@@ -551,14 +549,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14
   content:'';position:absolute;top:0;left:0;right:0;height:2px;
   background:var(--gradient-sig);
 }
-.hdr-logo{display:inline-block;width:20px;height:20px;color:var(--text);flex-shrink:0;line-height:0}
+.hdr-logo{display:inline-block;width:28px;height:28px;color:var(--text);flex-shrink:0;line-height:0}
 .hdr-logo svg{display:block;width:100%;height:100%}
-.hdr-sep{width:1px;height:16px;background:var(--border-hi)}
-.hdr-studio{font-family:var(--mono);font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:var(--dim)}
-.hdr-tool{font-family:var(--sans);font-size:13px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--text)}
-.hdr-ip{font-family:var(--mono);font-size:12px;color:var(--dim);letter-spacing:0.04em}
+.hdr-sep{width:1px;height:20px;background:var(--border-hi)}
+.hdr-studio{font-family:var(--mono);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:var(--dim)}
+.hdr-tool{font-family:var(--mono);font-size:15px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--text)}
+.hdr-ip{font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:0.04em}
 .hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px}
-.hdr-status{font-family:var(--mono);font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--dim)}
+.hdr-status{font-family:var(--mono);font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:var(--dim)}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--red);transition:background .4s}
 .dot.on{background:var(--green)}
 
