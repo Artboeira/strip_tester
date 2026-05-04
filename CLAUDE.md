@@ -106,7 +106,7 @@ O gradiente do header usa: `wine → brown → steel → olive → acc → dim`.
 ### Funcionalidade
 - **Salvar/carregar presets**: serializar `{strips, ip, effect, color, brightness, speed}` em JSON para arquivo local via endpoint `POST /api/preset` + `GET /api/presets`.
 - **Suporte RGBW**: adicionar campo `type: 'rgb' | 'rgbw'` por fita. RGBW = 4 ch/pixel, 128px/universo. Requer mudança em `send_all()` e `get_universe_map()`.
-- **Multi-segmento por fita**: definir offset de início de universo e canal por fita, em vez de empacotamento linear automático — necessário para instalações com nós Art-Net separados por zona.
+- **Multi-segmento por fita**: definir múltiplos segmentos independentes por fita (diferentes universos e canais por segmento), em vez de um único bloco contíguo por fita.
 - **Sequence number no Art-Net**: incrementar o byte `Sequence` (atualmente 0) para que receptores detectem pacotes fora de ordem.
 - **Blackout global**: botão que zera todos os canais e envia universos zerados imediatamente.
 - **Efeitos adicionais**: Comet (rastro longo), Palette Cycle, Noise/Perlin, Segmentos com efeitos independentes por fita.
@@ -114,7 +114,6 @@ O gradiente do header usa: `wine → brown → steel → olive → acc → dim`.
 
 ### Arquitetura
 - **Config persistente**: ao iniciar, ler `~/.led_tester.json` com última config e restaurar estado. Salvar automaticamente ao pressionar Apply.
-- **Múltiplos universos de origem**: atualmente o offset de universo é sempre 0. Adicionar campo `universe_offset` por fita ou global.
 - **Rate limiting do broadcast WS**: atualmente 10fps fixo. Tornar configurável ou adaptar ao FPS real da engine.
 - **Separar HTML em arquivo externo**: durante desenvolvimento, útil ter `template.html` em disco e embeddar apenas no build final (usando `python build.py > led_tester.py`).
 - **Test de conectividade Art-Net**: endpoint `POST /api/ping` que envia um universo de teste e aguarda resposta ArtPoll para confirmar se o nó está acessível.

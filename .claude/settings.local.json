@@ -7,7 +7,9 @@
       "Bash(brew install *)",
       "Bash(pdftoppm -v)",
       "Bash(pdftotext '/Users/artboeira/Downloads/ESTÚDIO AB_brandbook.pdf' -)",
-      "Bash(pdftoppm -r 150 -png -f 17 -l 22 '/Users/artboeira/Downloads/ESTÚDIO AB_brandbook.pdf' /tmp/bb_page)"
+      "Bash(pdftoppm -r 150 -png -f 17 -l 22 '/Users/artboeira/Downloads/ESTÚDIO AB_brandbook.pdf' /tmp/bb_page)",
+      "Bash(python -c \"import led_tester; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import led_tester; print\\('OK'\\)\")"
     ]
   }
 }

@@ -10,6 +10,7 @@ import asyncio
 import colorsys
 import json
 import math
+import os
 import random
 import socket
 import struct
@@ -59,7 +60,7 @@ class ArtNetSender:
 class StripManager:
     def __init__(self):
         self.artnet_ip: str = '2.0.0.1'
-        self.strips: list[dict] = []        # [{'name': str, 'pixels': int}]
+        self.strips: list[dict] = []        # [{'name': str, 'pixels': int, 'universe_offset': int, 'start_channel': int}]
         self._sender: ArtNetSender | None = None
 
     # ── internal ──
@@ -83,23 +84,23 @@ class StripManager:
         """
         Returns per-strip segments describing which Art-Net universe and
         channel range (1-indexed) each strip occupies.
-        Strips are packed contiguously in the global channel space.
-        170 RGB pixels = 510 channels fit cleanly; 512-ch universes mean
-        a pixel can straddle a universe boundary — the map reflects raw channels.
+        Each strip starts at universe_offset * 512 + (start_channel - 1).
+        A pixel can straddle a universe boundary — the map reflects raw channels.
         """
         result = []
-        global_ch = 0
         for strip in self.strips:
             n = strip['pixels']
             if n == 0:
                 result.append({'name': strip['name'], 'pixels': 0, 'segments': []})
                 continue
-            start_ch = global_ch
-            end_ch = global_ch + n * 3 - 1
+            u_off  = strip.get('universe_offset', 0)
+            ch1    = strip.get('start_channel', 1)          # 1-indexed
+            global_start = u_off * 512 + (ch1 - 1)
+            global_end   = global_start + n * 3 - 1
             segments = []
-            for u in range(start_ch // 512, end_ch // 512 + 1):
-                seg_s = max(start_ch, u * 512)
-                seg_e = min(end_ch, (u + 1) * 512 - 1)
+            for u in range(global_start // 512, global_end // 512 + 1):
+                seg_s = max(global_start, u * 512)
+                seg_e = min(global_end, (u + 1) * 512 - 1)
                 segments.append({
                     'universe': u,
                     'ch_start': seg_s % 512 + 1,    # 1-indexed display
@@ -107,35 +108,41 @@ class StripManager:
                     'channels': seg_e - seg_s + 1,
                 })
             result.append({'name': strip['name'], 'pixels': n, 'segments': segments})
-            global_ch += n * 3
         return result
 
     def send_all(self, all_pixels: list[list[tuple]]) -> dict[int, list[int]]:
         """
-        Flatten all pixel RGB values into a linear channel buffer, split by
-        universe (512 ch each), and fire Art-Net packets.
+        Write each strip's RGB data into sparse per-universe byte buffers
+        respecting each strip's universe_offset and start_channel.
         Returns {universe: [ch_values]} for the DMX monitor.
         """
-        channels: list[int] = []
+        universe_bufs: dict[int, bytearray] = {}
+
         for i, strip in enumerate(self.strips):
             pix = all_pixels[i] if i < len(all_pixels) else []
+            if not pix:
+                continue
+            u_off  = strip.get('universe_offset', 0)
+            ch1    = strip.get('start_channel', 1)
+            global_pos = u_off * 512 + (ch1 - 1)
             for r, g, b in pix:
-                channels += [r, g, b]
+                for val in (r, g, b):
+                    u  = global_pos // 512
+                    ch = global_pos % 512
+                    if u not in universe_bufs:
+                        universe_bufs[u] = bytearray(512)
+                    universe_bufs[u][ch] = val
+                    global_pos += 1
 
-        if not channels:
+        if not universe_bufs:
             return {}
 
         sender = self._sender_for()
         universe_data: dict[int, list[int]] = {}
-
-        for base in range(0, len(channels), 512):
-            chunk = channels[base:base + 512]
-            u = base // 512
-            universe_data[u] = chunk
-            data = bytes(chunk)
-            if len(data) % 2:
-                data += b'\x00'
-            sender.send_universe(u, data)
+        for u in sorted(universe_bufs.keys()):
+            data = bytes(universe_bufs[u])
+            universe_data[u] = list(data)
+            sender.send_universe(u, data)   # always even (512 bytes)
 
         return universe_data
 
@@ -316,6 +323,10 @@ sm       = StripManager()
 engine   = AnimationEngine(sm)
 ws_peers: set = set()
 
+FONTS_DIR: str = os.path.expanduser(
+    '~/Downloads/Estúdio AB Design System/fonts'
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP / WebSocket handlers
@@ -338,8 +349,10 @@ async def handle_post_config(request: web.Request) -> web.Response:
     raw  = data.get('strips', [])
     strips = [
         {
-            'name':   s.get('name', f'Strip {i + 1}'),
-            'pixels': max(1, int(s.get('pixels', 1))),
+            'name':            s.get('name', f'Strip {i + 1}'),
+            'pixels':          max(1, int(s.get('pixels', 1))),
+            'universe_offset': max(0, int(s.get('universe_offset', 0))),
+            'start_channel':   max(1, min(512, int(s.get('start_channel', 1)))),
         }
         for i, s in enumerate(raw)
     ]
@@ -359,6 +372,20 @@ async def handle_post_effect(request: web.Request) -> web.Response:
     if 'speed' in data:
         engine.speed = max(0.0, min(1.0, float(data['speed'])))
     return web.json_response({'ok': True})
+
+
+async def handle_font(request: web.Request) -> web.Response:
+    import os as _os
+    name = request.match_info['name']
+    if not name.endswith(('.otf', '.ttf', '.woff', '.woff2')):
+        raise web.HTTPNotFound()
+    path = _os.path.join(FONTS_DIR, name)
+    if not _os.path.isfile(path):
+        raise web.HTTPNotFound()
+    ct = 'font/ttf' if name.endswith('.ttf') else 'font/otf'
+    with open(path, 'rb') as f:
+        return web.Response(body=f.read(), content_type=ct,
+                            headers={'Cache-Control': 'public, max-age=86400'})
 
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
@@ -403,11 +430,12 @@ async def _on_startup(app: web.Application) -> None:
 
 def create_app(open_browser_port: int | None = None) -> web.Application:
     app = web.Application()
-    app.router.add_get('/',            handle_root)
-    app.router.add_get('/api/config',  handle_get_config)
-    app.router.add_post('/api/config', handle_post_config)
-    app.router.add_post('/api/effect', handle_post_effect)
-    app.router.add_get('/ws',          handle_ws)
+    app.router.add_get('/',              handle_root)
+    app.router.add_get('/api/config',    handle_get_config)
+    app.router.add_post('/api/config',   handle_post_config)
+    app.router.add_post('/api/effect',   handle_post_effect)
+    app.router.add_get('/fonts/{name}',  handle_font)
+    app.router.add_get('/ws',            handle_ws)
     app.on_startup.append(_on_startup)
 
     if open_browser_port:
@@ -420,15 +448,23 @@ def create_app(open_browser_port: int | None = None) -> web.Application:
 
 
 def main() -> None:
+    import os as _os
+    global FONTS_DIR
     parser = argparse.ArgumentParser(description='LED Strip Tester — Art-Net controller')
     parser.add_argument('--port',       type=int, default=8080, help='Web UI port (default 8080)')
     parser.add_argument('--no-browser', action='store_true',    help='Do not open browser automatically')
+    parser.add_argument('--fonts-dir',  default=None,           help='Path to Estúdio AB font files directory')
     args = parser.parse_args()
+
+    if args.fonts_dir:
+        FONTS_DIR = args.fonts_dir
 
     browser_port = None if args.no_browser else args.port
     app = create_app(open_browser_port=browser_port)
 
-    print(f'\n  LED Strip Tester  →  http://localhost:{args.port}\n')
+    fonts_ok = _os.path.isdir(FONTS_DIR)
+    print(f'\n  LED Strip Tester  →  http://localhost:{args.port}')
+    print(f'  Fonts: {FONTS_DIR} {"✓" if fonts_ok else "(not found — system fonts will be used)"}\n')
     web.run_app(app, host='0.0.0.0', port=args.port, print=None)
 
 
@@ -442,210 +478,256 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LED Strip Tester — Estúdio AB</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,700;1,9..40,300&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+/* ── Webfonts (served locally via /fonts/) ── */
+@font-face{font-family:'Neue Haas Grotesk Display';font-weight:400;font-style:normal;font-display:swap;src:url('/fonts/NeueHaasGrotDisp-55Roman-Trial.otf') format('opentype')}
+@font-face{font-family:'Neue Haas Grotesk Display';font-weight:500;font-style:normal;font-display:swap;src:url('/fonts/NeueHaasGrotDisp-65Medium-Trial.otf') format('opentype')}
+@font-face{font-family:'Neue Haas Grotesk Display';font-weight:700;font-style:normal;font-display:swap;src:url('/fonts/NeueHaasGrotDisp-75Bold-Trial.otf') format('opentype')}
+@font-face{font-family:'Neue Haas Grotesk Display';font-weight:900;font-style:normal;font-display:swap;src:url('/fonts/NeueHaasGrotDisp-95Black-Trial.otf') format('opentype')}
+@font-face{font-family:'Calling Code';font-weight:400;font-style:normal;font-display:swap;src:url('/fonts/CallingCode-Regular.otf') format('opentype')}
+@font-face{font-family:'Calling Code';font-weight:700;font-style:normal;font-display:swap;src:url('/fonts/CallingCode-Bold.ttf') format('truetype')}
+
 :root {
-  /* Estúdio AB — paleta principal */
-  --bg:     #121110;
-  --surf:   #1c1a17;
-  --surf2:  #242119;
-  --border: #383229;
-  --text:   #ede5d3;   /* creme */
-  --dim:    #b7baaf;   /* sage */
-  --acc:    #eea244;   /* âmbar */
-  --acc-lt: #f5c97a;
-  --brick:  #bf4128;
-  --olive:  #89993e;
-  --steel:  #4b657e;
-  --wine:   #8a1d33;
-  --brown:  #453b32;
-  --green:  #a8b86b;   /* olive-green para status ok */
-  --red:    #bf4128;
-  --r:      6px;
-  --font:   'DM Sans', 'Neue Haas Grotesk', 'Helvetica Neue', Helvetica, system-ui, sans-serif;
-  --mono:   'JetBrains Mono', 'Calling Code', 'Courier New', monospace;
+  /* ── Estúdio AB — palette tokens ── */
+  --ab-ink:    #222223;
+  --ab-bark:   #453B32;
+  --ab-sage:   #B7BAAF;
+  --ab-bone:   #EDE5D3;
+  --ab-ember:  #BF4128;
+  --ab-amber:  #EEA244;
+  --ab-amber-lt:#F5C97A;
+  --ab-steel:  #4B657E;
+  --ab-plum:   #582D40;
+  --ab-moss:   #89993E;
+  --ab-garnet: #8A1D33;
+
+  /* ── App surfaces (dark / ink mode) ── */
+  --bg:     #222223;
+  --surf:   #272421;
+  --surf2:  #2d2a27;
+  --border: rgba(237,229,211,0.13);
+  --border-hi: rgba(237,229,211,0.38);
+  --text:   #EDE5D3;
+  --dim:    #B7BAAF;
+  --acc:    #EEA244;
+  --acc-lt: #F5C97A;
+  --green:  #89993E;
+  --red:    #BF4128;
+
+  /* ── Typography ── */
+  --sans: 'Neue Haas Grotesk Display', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --mono: 'Calling Code', 'Sometype Mono', ui-monospace, monospace;
+
+  /* ── Identity ── */
+  --r:  0px;   /* square corners — brand rule */
+  --ri: 2px;   /* inputs only */
+
+  /* ── Motion ── */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur:  240ms;
+
+  /* ── Signature gradient ── */
+  --gradient-sig:
+    radial-gradient(70% 180% at -5% 70%, var(--ab-steel)  0%, transparent 55%),
+    radial-gradient(50% 180% at -2% 20%, var(--ab-plum)   0%, transparent 60%),
+    radial-gradient(45% 180% at 104% 50%,var(--ab-amber)  0%, transparent 55%),
+    radial-gradient(80% 120% at 55% 130%,var(--ab-moss)   0%, transparent 75%),
+    var(--ab-sage);
 }
 
 /* ── Reset & base ── */
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden}
-body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.5;display:flex;flex-direction:column}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
 
 /* ── Header ── */
 .hdr{
-  display:flex;align-items:center;gap:12px;
-  padding:0 20px;height:54px;
+  display:flex;align-items:center;gap:14px;
+  padding:0 22px;height:54px;
   background:var(--surf);border-bottom:1px solid var(--border);
   flex-shrink:0;position:relative;
 }
 .hdr::before{
   content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,var(--wine) 0%,var(--brown) 22%,var(--steel) 45%,var(--olive) 65%,var(--acc) 85%,var(--dim) 100%);
+  background:var(--gradient-sig);
 }
-.hdr-studio{font-size:9px;font-weight:500;letter-spacing:3px;text-transform:uppercase;color:var(--dim)}
-.hdr-sep{width:1px;height:14px;background:var(--border)}
-.hdr-tool{font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text)}
-.hdr-ip{font-family:var(--mono);font-size:11px;color:var(--dim)}
-.hdr-right{margin-left:auto;display:flex;align-items:center;gap:8px}
-.hdr-status{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim)}
+.hdr-logo{display:inline-block;width:20px;height:20px;color:var(--text);flex-shrink:0;line-height:0}
+.hdr-logo svg{display:block;width:100%;height:100%}
+.hdr-sep{width:1px;height:16px;background:var(--border-hi)}
+.hdr-studio{font-family:var(--mono);font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:var(--dim)}
+.hdr-tool{font-family:var(--sans);font-size:13px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--text)}
+.hdr-ip{font-family:var(--mono);font-size:12px;color:var(--dim);letter-spacing:0.04em}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.hdr-status{font-family:var(--mono);font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--dim)}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--red);transition:background .4s}
 .dot.on{background:var(--green)}
 
 /* ── Layout ── */
 .main{display:flex;flex:1;overflow:hidden}
 .sidebar{
-  width:292px;flex-shrink:0;
+  width:340px;flex-shrink:0;
   background:var(--surf);border-right:1px solid var(--border);
-  overflow-y:auto;padding:15px;
-  display:flex;flex-direction:column;gap:11px;
+  overflow-y:auto;padding:16px;
+  display:flex;flex-direction:column;gap:12px;
 }
 .rhs{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.rhs-scroll{flex:1;overflow-y:auto;padding:15px;display:flex;flex-direction:column;gap:11px}
+.rhs-scroll{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
 
 /* ── Sections ── */
-.sec{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);padding:14px}
+.sec{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);padding:16px}
 .sec-hd{
-  font-size:9px;font-weight:700;letter-spacing:3px;text-transform:uppercase;
-  color:var(--acc);margin-bottom:13px;
-  display:flex;align-items:center;gap:9px;
+  font-family:var(--mono);font-size:10px;font-weight:400;
+  letter-spacing:0.12em;text-transform:uppercase;
+  color:var(--dim);margin-bottom:14px;
+  padding-bottom:8px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
 }
-.sec-hd::after{content:'';flex:1;height:1px;background:var(--border)}
 
 /* ── Form ── */
-.frow{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.frow{display:flex;align-items:center;gap:8px;margin-bottom:9px}
 .frow:last-child{margin-bottom:0}
 .flbl{
-  font-size:9px;font-weight:500;letter-spacing:1.5px;text-transform:uppercase;
+  font-family:var(--mono);font-size:10px;letter-spacing:0.12em;text-transform:uppercase;
   color:var(--dim);min-width:36px;
 }
 input[type=text],input[type=number]{
-  background:var(--bg);border:1px solid var(--border);color:var(--text);
-  padding:6px 10px;border-radius:5px;font-size:12px;font-family:var(--font);
-  flex:1;outline:none;transition:border-color .2s;
+  font-family:var(--mono);font-size:13px;
+  padding:9px 12px;border:1px solid rgba(237,229,211,0.2);
+  background:transparent;color:var(--text);
+  border-radius:var(--ri);flex:1;outline:none;
+  transition:border-color var(--dur) var(--ease);
 }
-input:focus{border-color:var(--acc)}
+input:focus{border-color:rgba(237,229,211,0.65);box-shadow:0 0 0 3px rgba(237,229,211,0.07)}
 
-/* ── Buttons ── */
+/* ── Buttons — design system spec ── */
 .btn{
-  padding:6px 14px;border-radius:5px;border:none;cursor:pointer;
-  font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;
-  font-family:var(--font);transition:all .15s;
+  font-family:var(--mono);font-size:11px;font-weight:700;
+  letter-spacing:0.1em;text-transform:uppercase;
+  padding:9px 18px;border:1px solid var(--border-hi);border-radius:var(--r);
+  background:transparent;color:var(--text);cursor:pointer;
+  transition:all var(--dur) var(--ease);
 }
-.btn-pri{background:var(--acc);color:var(--bg)}.btn-pri:hover{background:var(--acc-lt)}
-.btn-out{background:transparent;border:1px solid var(--border);color:var(--dim)}
+.btn:hover{background:var(--text);color:var(--bg)}
+.btn-pri{background:var(--text);color:var(--bg);border-color:var(--text)}
+.btn-pri:hover{background:transparent;color:var(--text);border-color:var(--text)}
+.btn-out{color:var(--dim);border-color:var(--border)}
 .btn-out:hover{border-color:var(--acc);color:var(--acc)}
-.btn-del{background:transparent;border:1px solid transparent;color:#4a4540;padding:4px 8px}
-.btn-del:hover{border-color:var(--brick);color:var(--brick)}
-.btn-sm{padding:5px 11px;font-size:9px}
-.btn-row{display:flex;gap:8px;margin-top:10px}
+.btn-del{border:1px solid transparent;color:rgba(237,229,211,0.28);padding:4px 8px}
+.btn-del:hover{border-color:var(--red);color:var(--red)}
+.btn-sm{padding:6px 14px;font-size:10px}
+.btn-row{display:flex;gap:8px;margin-top:12px}
 
 /* ── Strip list ── */
-.strip-list{display:flex;flex-direction:column;gap:6px;margin-bottom:2px}
+.strip-list{display:flex;flex-direction:column;gap:8px;margin-bottom:2px}
 .strip-item{
-  display:flex;align-items:center;gap:6px;
-  background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:5px 9px;
+  display:flex;flex-direction:column;gap:6px;
+  background:var(--bg);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;
 }
-.strip-item input[type=text]{max-width:86px}
-.strip-item input[type=number]{width:62px;flex:none}
-.px-lbl{font-size:9px;letter-spacing:.5px;color:var(--dim)}
+.strip-row{display:flex;align-items:center;gap:6px}
+.strip-item input[type=text]{flex:1;min-width:0}
+.strip-item input[type=number]{width:72px;flex:none}
+.strip-item .num-sm{width:64px !important}
+.px-lbl{font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--dim)}
 
 /* ── Universe map ── */
-.umap{display:flex;flex-direction:column;gap:4px}
+.umap{display:flex;flex-direction:column;gap:3px}
 .umap-row{
-  display:flex;gap:10px;align-items:flex-start;
-  background:var(--bg);border-radius:4px;padding:5px 8px;
-  border-left:2px solid var(--brown);
+  display:flex;gap:12px;align-items:flex-start;
+  padding:6px 10px;border-left:2px solid var(--ab-bark);
 }
-.u-tag{font-family:var(--mono);font-size:10px;font-weight:500;color:var(--acc);min-width:22px}
+.u-tag{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--acc);min-width:28px;letter-spacing:0.06em}
 .u-entries{display:flex;flex-direction:column;gap:2px}
-.u-entry{font-family:var(--mono);font-size:10px;color:var(--dim)}
+.u-entry{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:0.02em}
 .u-entry span{color:var(--text)}
 
 /* ── Color ── */
 .color-area{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 input[type=color]{
   width:52px;height:52px;border:1px solid var(--border);border-radius:var(--r);
-  cursor:pointer;padding:0;background:none;flex-shrink:0;transition:border-color .2s;
+  cursor:pointer;padding:0;background:none;flex-shrink:0;
+  transition:border-color var(--dur) var(--ease);
 }
-input[type=color]:hover{border-color:var(--acc)}
+input[type=color]:hover{border-color:var(--border-hi)}
 .swatches{display:flex;gap:6px;flex-wrap:wrap}
 .sw{
-  width:24px;height:24px;border-radius:50%;cursor:pointer;
-  border:2px solid transparent;transition:border-color .15s,transform .12s;flex-shrink:0;
+  width:24px;height:24px;border-radius:var(--r);cursor:pointer;
+  border:1px solid transparent;
+  transition:transform 140ms var(--ease),border-color 140ms var(--ease);flex-shrink:0;
 }
-.sw:hover{transform:scale(1.2);border-color:rgba(237,229,211,.35)}
-.sw.active{border-color:var(--text)}
+.sw:hover{transform:scale(1.18);border-color:rgba(237,229,211,0.45)}
+.sw.active{border-color:var(--text);border-width:2px}
 
 /* ── Sliders ── */
 .slider-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .slider-row:last-child{margin-bottom:0}
-.slbl{font-size:9px;font-weight:500;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);min-width:70px}
-.sval{font-family:var(--mono);font-size:11px;color:var(--acc);min-width:36px;text-align:right}
+.slbl{font-family:var(--mono);font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--dim);min-width:70px}
+.sval{font-family:var(--mono);font-size:12px;color:var(--acc);min-width:36px;text-align:right}
 input[type=range]{flex:1;accent-color:var(--acc);cursor:pointer;height:3px}
 
 /* ── Effects grid ── */
-.eff-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(106px,1fr));gap:6px}
+.eff-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(106px,1fr));gap:5px}
 .eff-btn{
-  padding:10px 8px;border-radius:5px;border:1px solid var(--border);
-  background:var(--bg);color:var(--dim);cursor:pointer;text-align:center;
-  font-size:11px;font-weight:600;font-family:var(--font);
-  transition:all .15s;display:flex;flex-direction:column;align-items:center;gap:5px;
+  padding:10px 8px;border:1px solid var(--border);border-radius:var(--r);
+  background:transparent;color:var(--dim);cursor:pointer;text-align:center;
+  font-family:var(--mono);font-size:11px;font-weight:700;
+  letter-spacing:0.06em;text-transform:uppercase;
+  transition:all var(--dur) var(--ease);
+  display:flex;flex-direction:column;align-items:center;gap:5px;
 }
-.eff-btn:hover{border-color:var(--acc);color:var(--text)}
-.eff-btn.active{
-  border-color:var(--acc);background:rgba(238,162,68,.09);color:var(--acc);
-}
-.eff-icon{font-size:17px;line-height:1}
+.eff-btn:hover{border-color:rgba(237,229,211,0.35);color:var(--text)}
+.eff-btn.active{border-color:var(--acc);background:rgba(238,162,68,.07);color:var(--acc)}
+.eff-icon{font-size:18px;line-height:1}
 
 /* ── Strip preview ── */
 .prev-panel{
-  padding:10px 16px 12px;border-top:1px solid var(--border);
+  padding:12px 18px 14px;border-top:1px solid var(--border);
   flex-shrink:0;background:var(--surf);
 }
 .prev-hd{
-  font-size:9px;font-weight:700;letter-spacing:3px;text-transform:uppercase;
-  color:var(--acc);margin-bottom:9px;
+  font-family:var(--mono);font-size:10px;letter-spacing:0.12em;text-transform:uppercase;
+  color:var(--dim);margin-bottom:10px;
 }
 .prev-rows{display:flex;flex-direction:column;gap:6px}
 .prev-row{display:flex;align-items:center;gap:10px}
-.prev-name{font-size:10px;letter-spacing:.3px;color:var(--dim);min-width:60px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.prev-wrap{flex:1;height:16px;border-radius:3px;overflow:hidden;border:1px solid var(--border)}
+.prev-name{font-family:var(--mono);font-size:11px;letter-spacing:0.03em;color:var(--dim);min-width:60px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prev-wrap{flex:1;height:16px;border-radius:var(--r);overflow:hidden;border:1px solid var(--border)}
 canvas.pcanvas{display:block;width:100%;height:100%;image-rendering:pixelated}
 
 /* ── DMX Monitor ── */
-.mon-panel{padding:0 16px 12px;border-top:1px solid var(--border);flex-shrink:0;background:var(--surf)}
-.mon-tabs{display:flex;gap:4px;padding:9px 0 7px}
+.mon-panel{padding:0 18px 14px;border-top:1px solid var(--border);flex-shrink:0;background:var(--surf)}
+.mon-tabs{display:flex;gap:4px;padding:10px 0 8px}
 .mon-tab{
-  padding:3px 12px;border-radius:4px;background:transparent;
-  border:1px solid var(--border);color:var(--dim);cursor:pointer;
-  font-family:var(--mono);font-size:10px;letter-spacing:.5px;transition:all .15s;
+  font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;
+  padding:5px 14px;border:1px solid var(--border);border-radius:var(--r);
+  background:transparent;color:var(--dim);cursor:pointer;
+  transition:all var(--dur) var(--ease);
 }
-.mon-tab.active{background:var(--brown);border-color:var(--brown);color:var(--acc)}
-.mon-empty{font-size:11px;color:var(--dim);padding:4px 0;font-style:italic}
+.mon-tab.active{background:var(--ab-bark);border-color:var(--ab-bark);color:var(--acc)}
+.mon-empty{font-family:var(--mono);font-size:12px;color:var(--dim);padding:4px 0}
 .mon-grid{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(76px,1fr));
-  gap:2px;max-height:84px;overflow-y:auto;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));
+  gap:3px;max-height:140px;overflow-y:auto;
 }
 .dcell{
-  background:var(--bg);border-radius:3px;padding:3px 6px;
-  font-family:var(--mono);font-size:10px;
-  display:flex;justify-content:space-between;border:1px solid var(--border);
+  background:var(--bg);border:1px solid var(--border);border-radius:var(--r);
+  padding:5px 8px;font-family:var(--mono);font-size:12px;
+  display:flex;justify-content:space-between;
 }
 .dch{color:var(--dim)}.dval{color:var(--text)}.dval.hi{color:var(--acc)}
 
 /* ── Scrollbar ── */
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:var(--bg)}
-::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:var(--brown)}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(237,229,211,0.16);border-radius:0}
+::-webkit-scrollbar-thumb:hover{background:rgba(237,229,211,0.3)}
 </style>
 </head>
 <body>
 
 <!-- ── Header ── -->
 <div class="hdr">
+  <span class="hdr-logo"><svg viewBox="0 0 5000 5000" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><polygon points="818 1888.36 818 2500 1735.45 2500 1735.45 2805.82 818 3723.27 818 2500 206.36 2500 206.36 4334.91 818 4334.91 1123.82 4334.91 1735.45 3723.27 1735.45 4334.91 2347.09 4334.91 2347.09 2500 2347.09 1888.36 818 1888.36"/><polygon points="4182 2500 4182 3723.27 3264.55 2805.82 3264.55 2500 4182 2500 4182 1888.36 3264.55 1888.36 3264.55 665.09 2652.91 665.09 2652.91 4334.91 3264.55 4334.91 3264.55 3723.27 3876.18 4334.91 4182 4334.91 4793.64 4334.91 4793.64 2500 4182 2500"/></svg></span>
+  <div class="hdr-sep"></div>
   <span class="hdr-studio">Estúdio AB</span>
   <div class="hdr-sep"></div>
   <span class="hdr-tool">LED Strip Tester</span>
@@ -771,7 +853,7 @@ const PRESETS = [
 ];
 
 const S = {
-  strips:  [{name:'Strip 1', pixels:150}],
+  strips:  [{name:'Strip 1', pixels:150, universe_offset:0, start_channel:1}],
   ip:      '2.0.0.1',
   effect:  'rainbow_wave',
   color:   '#ff0000',
@@ -822,18 +904,30 @@ function renderStrips() {
     const row = document.createElement('div');
     row.className = 'strip-item';
     row.innerHTML = `
-      <input type="text" value="${s.name}" placeholder="Name"
-        oninput="S.strips[${i}].name=this.value">
-      <input type="number" value="${s.pixels}" min="1" max="4096"
-        oninput="S.strips[${i}].pixels=Math.max(1,parseInt(this.value)||1)">
-      <span class="px-lbl">px</span>
-      <button class="btn btn-del" onclick="removeStrip(${i})">✕</button>`;
+      <div class="strip-row">
+        <input type="text" value="${s.name}" placeholder="Name"
+          oninput="S.strips[${i}].name=this.value">
+        <input type="number" value="${s.pixels}" min="1" max="4096"
+          oninput="S.strips[${i}].pixels=Math.max(1,parseInt(this.value)||1)">
+        <span class="px-lbl">px</span>
+        <button class="btn btn-del" onclick="removeStrip(${i})">✕</button>
+      </div>
+      <div class="strip-row">
+        <span class="px-lbl">U</span>
+        <input type="number" class="num-sm" value="${s.universe_offset||0}" min="0" max="32767"
+          title="Universe offset"
+          oninput="S.strips[${i}].universe_offset=Math.max(0,parseInt(this.value)||0)">
+        <span class="px-lbl">ch</span>
+        <input type="number" class="num-sm" value="${s.start_channel||1}" min="1" max="512"
+          title="Start channel (1–512)"
+          oninput="S.strips[${i}].start_channel=Math.max(1,Math.min(512,parseInt(this.value)||1))">
+      </div>`;
     el.appendChild(row);
   });
 }
 
 function addStrip() {
-  S.strips.push({name:`Strip ${S.strips.length+1}`, pixels:60});
+  S.strips.push({name:`Strip ${S.strips.length+1}`, pixels:60, universe_offset:0, start_channel:1});
   renderStrips();
 }
 function removeStrip(i) {
