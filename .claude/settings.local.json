@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 list *)",
+      "Bash(pip3 show *)",
+      "Bash(python3 -c ' *)",
+      "Bash(brew install *)",
+      "Bash(pdftoppm -v)",
+      "Bash(pdftotext '/Users/artboeira/Downloads/ESTÚDIO AB_brandbook.pdf' -)",
+      "Bash(pdftoppm -r 150 -png -f 17 -l 22 '/Users/artboeira/Downloads/ESTÚDIO AB_brandbook.pdf' /tmp/bb_page)"
+    ]
+  }
+}
